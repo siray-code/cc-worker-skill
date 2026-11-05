@@ -26,9 +26,34 @@ Use macOS, Linux, or WSL with Bash, Python 3.9+, Git 2.25+, Codex, and a configu
 [Claude Code CLI](https://code.claude.com/docs/en/overview) available as `claude`.
 No Python packages or Agent SDK installation are required at runtime.
 
-From a checkout of this repository:
+### Quick install with Skills CLI
+
+Install directly from GitHub with [Skills CLI](https://github.com/vercel-labs/skills),
+without manually cloning this repository. The `npx` command requires Node.js 22.20+:
 
 ```bash
+npx --yes skills add siray-code/cc-worker-skill --skill cc-worker --agent codex --global --yes
+```
+
+Equivalent commands using pnpm or Bun:
+
+```bash
+pnpm dlx skills add siray-code/cc-worker-skill --skill cc-worker --agent codex --global --yes
+bunx skills add siray-code/cc-worker-skill --skill cc-worker --agent codex --global --yes
+```
+
+Choose one command. `--global` installs for your user across projects; omit it and
+run from your project root for project-local installation. `--agent codex` selects
+Codex, and `--yes` skips Skills CLI confirmation prompts. Node.js/package runners
+are only needed for this installation method, not when running the skill.
+
+### Install from a checkout
+
+Clone the repository and run the included installer:
+
+```bash
+git clone https://github.com/siray-code/cc-worker-skill.git
+cd cc-worker-skill
 ./install.sh
 ```
 

@@ -25,9 +25,34 @@ provider 返回的用量数据也不能直接衡量 Codex 的节省量。
 在 PATH 中可执行的 [Claude Code CLI](https://code.claude.com/docs/en/overview)。
 运行时无需额外 Python 包或 Agent SDK。
 
-进入本仓库后执行：
+### 使用 Skills CLI 快速安装
+
+通过 [Skills CLI](https://github.com/vercel-labs/skills) 直接从 GitHub 安装，
+无需手动克隆仓库。`npx` 命令需要 Node.js 22.20+：
 
 ```bash
+npx --yes skills add siray-code/cc-worker-skill --skill cc-worker --agent codex --global --yes
+```
+
+使用 pnpm 或 Bun 的等价命令：
+
+```bash
+pnpm dlx skills add siray-code/cc-worker-skill --skill cc-worker --agent codex --global --yes
+bunx skills add siray-code/cc-worker-skill --skill cc-worker --agent codex --global --yes
+```
+
+以上命令任选其一。`--global` 表示用户级安装，所有项目均可使用；
+如需项目级安装，在项目根目录执行并去掉 `--global`。
+`--agent codex` 指定安装到 Codex，`--yes` 跳过 Skills CLI 的确认提示。
+Node.js 和包执行工具仅用于这种安装方式，运行 skill 时不需要。
+
+### 从本地仓库安装
+
+克隆仓库并执行自带安装脚本：
+
+```bash
+git clone https://github.com/siray-code/cc-worker-skill.git
+cd cc-worker-skill
 ./install.sh
 ```
 
