@@ -13,7 +13,10 @@ actual changes. Claude Code can use Anthropic, DeepSeek, or another compatible p
 ## Choose the right work
 
 - Delegate substantial implementation by default once this skill applies. Handle
-  trivial edits, small finishing corrections and necessary takeover directly.
+  trivial edits and small finishing corrections directly. Take over only when the
+  worker actually ran and could not complete the task (repeated failure, missing
+  session, or a design correction only Codex can make), never because the worker
+  could not start or could not reach the model API.
 - Codex performs source discovery and reads the complete behavior-critical code
   and immediate contracts. Do not offload discovery or prescribe a design based
   only on a worker summary. Keep task context focused on the relevant source.
@@ -30,9 +33,19 @@ actual changes. Claude Code can use Anthropic, DeepSeek, or another compatible p
 
 Resolve `scripts/run-cc.sh` relative to this loaded skill. Read
 [dispatch.md](references/dispatch.md) before the first dispatch for the task schema,
-commands, statuses and snapshot limitations. Run `doctor` once when the environment
-is unfamiliar or a prior invocation failed to start; do not call a model just to
-check configuration.
+commands, statuses and snapshot limitations. Run `doctor` before the first dispatch
+in a session; it checks capabilities and API reachability without calling a model.
+
+The worker process needs outbound network access to the model API. Codex's
+`workspace-write` sandbox disables network access by default, and dispatch fails
+with a connection error when started under it. If `doctor` reports `api.status` as
+`unreachable`, prepare task files normally and run `run`/`resume` with
+`sandbox_permissions: "require_escalated"` and a short justification, or ask the
+user to enable network access for Codex (`[sandbox_workspace_write]
+network_access = true`). `skipped` only means a proxy, a cloud provider flag, or
+`CC_WORKER_SKIP_API_CHECK` bypassed the direct probe. A connectivity failure is
+not a reason for Codex to take over implementation: fix the environment and
+dispatch a new run.
 
 Codex writes a task JSON with an exact file allowlist, relevant references, concrete
 behavior and acceptance conditions, and the narrowest meaningful check commands.

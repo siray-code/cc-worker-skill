@@ -28,9 +28,10 @@ class WorkerTests(unittest.TestCase):
         self.env = os.environ.copy()
         self.env.update({"PATH": str(self.bin) + os.pathsep + os.environ["PATH"],
                          "CC_WORKER_STATE_DIR": str(self.base / "state"), "CC_WORKER_ENV_FILE": "",
-                         "PYTHONDONTWRITEBYTECODE": "1", "GIT_CONFIG_NOSYSTEM": "1",
-                         "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0"})
-        for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "FAKE_HELP"):
+                         "CC_WORKER_SKIP_API_CHECK": "1", "PYTHONDONTWRITEBYTECODE": "1",
+                         "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0"})
+        for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "FAKE_HELP",
+                    "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
             self.env.pop(key, None)
         self.git("init", "-q")
         self.git("config", "user.name", "Test")
@@ -274,6 +275,61 @@ class WorkerTests(unittest.TestCase):
         result = self.invoke("doctor")
         self.assertNotIn("fake-private-key", json.dumps(result))
         self.assertIn("ANTHROPIC_API_KEY", result["credential_variables_present"])
+        self.assertEqual(result["api"]["status"], "skipped")
+
+    def test_doctor_reads_endpoint_and_credentials_from_claude_settings(self):
+        config = self.base / "claude-config"
+        config.mkdir()
+        (config / "settings.json").write_text(json.dumps({"env": {
+            "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+            "ANTHROPIC_AUTH_TOKEN": "fake-private-token"}}))
+        self.env["CLAUDE_CONFIG_DIR"] = str(config)
+        self.env.pop("ANTHROPIC_BASE_URL", None)
+        result = self.invoke("doctor")
+        self.assertEqual(result["api"]["status"], "skipped")
+        self.assertEqual(result["api"]["host"], "api.deepseek.com")
+        self.assertEqual(result["api"]["endpoint_source"], str(config / "settings.json"))
+        self.assertIn("ANTHROPIC_AUTH_TOKEN", result["credential_variables_present"])
+        self.assertNotIn("fake-private-token", json.dumps(result))
+
+    def test_doctor_skips_probe_for_cloud_providers(self):
+        self.env.pop("CC_WORKER_SKIP_API_CHECK")
+        self.env["CLAUDE_CODE_USE_BEDROCK"] = "1"
+        result = self.invoke("doctor")
+        self.assertEqual(result["api"]["status"], "skipped")
+        self.assertIn("CLAUDE_CODE_USE_BEDROCK", result["api"]["detail"])
+
+    def test_unreachable_api_fails_fast_without_consuming_attempt(self):
+        events = self.base / "events.jsonl"
+        self.env.pop("CC_WORKER_SKIP_API_CHECK")
+        self.env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:1/anthropic"
+        result = self.run_task(self.task(action={"record": str(events), "writes": {"a.txt": "should not run\n"}}), code=1)
+        self.assertEqual(result["status"], "worker_failed")
+        self.assertEqual(result["attempts"], 0)
+        self.assertEqual(result["api_check"]["status"], "unreachable")
+        self.assertIn("Cannot reach the Claude model API", result["error"])
+        self.assertIn("sandbox_permissions", result["error"])
+        self.assertFalse(events.exists())
+        self.assertEqual((self.source / "a.txt").read_text(), "original a\n")
+        self.assertFalse(list((self.base / "state").glob("edit-*/attempt-*")))
+
+    def test_resume_after_preflight_failure_requests_new_run(self):
+        self.env.pop("CC_WORKER_SKIP_API_CHECK")
+        self.env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:1/anthropic"
+        result = self.run_task(code=1)
+        correction = self.base / "correction.txt"
+        correction.write_text("Fix it")
+        resumed = self.invoke("resume", "--run", result["run_id"], "--prompt-file", correction, code=2)
+        self.assertIn("dispatch a new run", resumed["error"])
+
+    def test_worker_api_error_is_surfaced_with_sandbox_hint(self):
+        action = {"is_error": True, "api_error": "connection_failed", "terminal_reason": "api_error",
+                  "summary": "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)"}
+        result = self.run_task(self.task(action=action), code=1)
+        self.assertEqual(result["status"], "worker_failed")
+        self.assertIn("connection_failed", result["error"])
+        self.assertIn("ENOTFOUND", result["error"])
+        self.assertIn("sandbox_permissions", result["error"])
 
     def test_installer_is_idempotent_and_protects_existing_paths(self):
         target = self.base / "skills with spaces"

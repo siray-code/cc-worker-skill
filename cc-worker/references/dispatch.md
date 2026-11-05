@@ -2,7 +2,9 @@
 
 Run commands using `scripts/run-cc.sh` from this installed skill, not a guessed
 global path. Runtime requirements: Bash, Python 3.9+, Git, and Claude Code in PATH.
-`doctor` checks local capabilities without calling a model or printing credentials.
+`doctor` checks local capabilities, lists credential-related variable names found in
+the environment or user-level Claude settings, and probes the model API host (DNS
+plus TCP, no model call) without printing values.
 
 ## Task contract
 
@@ -56,8 +58,30 @@ options and permits at most two worker attempts total. There are no automatic re
 
 Use the run ID to resume exactly its session. Never use `claude --continue`: parallel
 sessions can make "most recent" point to another task. If no usable session is
-available, inspect the result and take over. Supply the exact failed-check log and
-a focused correction; avoid rediscovering the task or pasting full logs into Codex.
+available after an attempt, inspect the result and take over; a run that never
+started a worker (for example, an API preflight failure) should be dispatched again
+instead. Supply the exact failed-check log and a focused correction; avoid
+rediscovering the task or pasting full logs into Codex.
+
+## Sandbox and network
+
+The worker must reach the model API. Before launching Claude Code, `run` and `resume`
+probe the configured endpoint (`ANTHROPIC_BASE_URL`, then user-level Claude
+settings, then `https://api.anthropic.com`) with DNS and a TCP connection. A failure returns
+`worker_failed` immediately with an actionable `error`, an `api_check` object, no
+attempt directory, no consumed attempt, and no source changes. Fix network access and
+dispatch a new run; there is no session to resume after a preflight failure.
+
+Codex's `workspace-write` sandbox has `network_access: false` by default. Task files
+can be written inside the sandbox, but `run`/`resume` must execute with
+`sandbox_permissions: "require_escalated"` and a short justification, or after the
+user enables network access for Codex
+(`[sandbox_workspace_write] network_access = true`). Do not take over implementation
+because of a connection failure. `doctor` reports `api.status` as `ok`, `unreachable`, `invalid`,
+or `skipped`. `skipped` is not success: it means `CC_WORKER_SKIP_API_CHECK` is set, or
+a proxy variable or cloud provider flag (`CLAUDE_CODE_USE_BEDROCK`,
+`CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`) is configured, so the direct
+probe was bypassed.
 
 ## Snapshot and review behavior
 
@@ -100,8 +124,8 @@ Legacy `run-cc.sh "<prompt>" [workdir]` emits text and a run ID; it is in place,
 has no file allowlist or runner checks, and is intended only for compatibility.
 
 Result fields include `run_id`, `task_id`, `status`, `isolated`, `session_id`,
-`attempts`, `summary`, `changed_files`, `out_of_scope`, `checks`, `artifacts`,
-`workdir`, `result_file`, and `patch` when available. CLI-provided usage/cost metrics
+`attempts`, `summary`, `changed_files`, `out_of_scope`, `checks`, `api_check`,
+`artifacts`, `workdir`, `result_file`, and `patch` when available. CLI-provided usage/cost metrics
 are recorded when present; they do not measure Codex savings or guarantee proxy billing.
 Full state and logs live in `result_file` and `attempt-N/`.
 Large change lists in stdout are limited to 50 entries with a corresponding
@@ -109,7 +133,9 @@ Large change lists in stdout are limited to 50 entries with a corresponding
 
 Statuses: `preparation_failed`, `prepared`, `running`, `worker_failed`, `timed_out`,
 `cancelled`, `validation_failed`, `scope_violation`, `ready_for_review`, `applied`.
-Scope violations block application even if the worker or checks otherwise succeeded.
+`worker_failed` also covers a model API preflight failure; in that case `api_check`
+explains why, `attempts` is unchanged, and no worker ran. Scope violations block
+application even if the worker or checks otherwise succeeded.
 A batch reports every task separately and returns `batch_failed` if any task fails.
 Successful siblings remain available for independent review and application.
 
@@ -127,3 +153,6 @@ them. No environment variable values are printed by `doctor`.
 The Bash entrypoint loads `~/.cc-worker.env` as trusted shell code in its subprocess.
 Its assignments override inherited values. `CC_WORKER_ENV_FILE` selects another file;
 an empty value disables loading. `--model` overrides the resulting model configuration.
+`CC_WORKER_SKIP_API_CHECK=1` disables the API reachability probe when a proxy or
+custom transport makes the direct check misleading; use it deliberately, since it
+also disables the sandbox/no-network fast failure.

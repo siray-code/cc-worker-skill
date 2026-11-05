@@ -67,5 +67,8 @@ else:
                       "num_turns": 2, "usage": {"input_tokens": 100, "output_tokens": 20}}
     for key in action.get("omit_fields", []):
         payload.pop(key, None)
+    for key in ("api_error", "terminal_reason"):
+        if action.get(key):
+            payload[key] = action[key]
     print(json.dumps(payload))
 sys.exit(1 if action.get("fail") else 0)

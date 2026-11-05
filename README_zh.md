@@ -85,6 +85,12 @@ $cc-worker 给用户服务增加 CSV 导出并补充回归测试。
 源码探索和架构决策由 Codex 完成。实质性编码默认派单，简单修改和少量收尾可以直接完成。
 共享接口、锁文件、存在实现依赖的任务，以及依赖共享可变服务的测试，需要顺序执行。
 
+Codex 默认的 `workspace-write` 沙箱不开放网络，而 worker 需要访问模型 API。
+因此派单时应使用 `sandbox_permissions: "require_escalated"`，或在
+`~/.codex/config.toml` 中设置 `[sandbox_workspace_write] network_access = true`。
+`doctor` 会报告 `api.status`；网络被拦截时派单会快速失败，不消耗尝试次数，也不会改动仓库。
+遇到连接失败应修复网络后重新派单，不要因此改为 Codex 自己实现。
+
 ## 配置模型服务
 
 已配置好的 Claude Code 可直接使用。执行器继承其环境和配置，不强制切换模型，
@@ -105,13 +111,15 @@ export ANTHROPIC_MODEL="deepseek-flash[1m]"
 `CC_WORKER_ENV_FILE=/path/to/file` 可指定其他文件，`CC_WORKER_ENV_FILE=''` 可禁用加载。
 `--model` 优先于模型配置。
 
-本地诊断不会调用模型，也不显示凭据值：
+本地诊断会检查兼容性和模型 API 可达性，不调用模型，也不显示凭据值：
 
 ```bash
 RUNNER="$HOME/.agents/skills/cc-worker/scripts/run-cc.sh"
 "$RUNNER" doctor
 ```
 
+`api.status` 为 `ok`、`unreachable`、`invalid` 或 `skipped`（设置了代理变量、
+云厂商标记或 `CC_WORKER_SKIP_API_CHECK` 时会跳过直连探测）。
 Claude CLI 需支持 JSON 输出、追加系统指令、`acceptEdits` 和工具选择。
 缺少必要能力时明确报错，不会自动回退到跳过权限检查。相关机制见
 [Claude Code 自动化文档](https://code.claude.com/docs/en/headless)。

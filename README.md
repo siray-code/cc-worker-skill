@@ -90,6 +90,14 @@ defaults to delegation; trivial edits and small corrections can be completed
 directly. Independent tasks can run concurrently. Shared interfaces, lockfiles,
 dependent changes, and tests using shared mutable services must run in sequence.
 
+Codex's default `workspace-write` sandbox has no network access. The worker needs
+outbound access to the model API, so run the dispatch with
+`sandbox_permissions: "require_escalated"` (or set
+`[sandbox_workspace_write] network_access = true` in `~/.codex/config.toml`).
+`doctor` reports `api.status`; a blocked dispatch fails fast with no attempt consumed
+and no repository changes. Fix connectivity and dispatch again instead of taking over
+the implementation.
+
 ## Configure a provider
 
 An already configured Claude Code installation works without additional setup.
@@ -111,15 +119,18 @@ code in the runner subprocess; its assignments override inherited values.
 `CC_WORKER_ENV_FILE=/path/to/file` selects a different file, and
 `CC_WORKER_ENV_FILE=''` disables loading it. `--model` overrides model configuration.
 
-Check local compatibility without calling a model or displaying credential values:
+Check local compatibility and model API reachability without calling a model or
+displaying credential values:
 
 ```bash
 RUNNER="$HOME/.agents/skills/cc-worker/scripts/run-cc.sh"
 "$RUNNER" doctor
 ```
 
-The CLI must support JSON output, appended system instructions, `acceptEdits`, and
-tool selection. Missing required capabilities fail explicitly. The runner never
+`api.status` is `ok`, `unreachable`, `invalid`, or `skipped` (a proxy variable, a
+cloud provider flag, or `CC_WORKER_SKIP_API_CHECK` bypassed the direct probe). The CLI must support JSON
+output, appended system instructions, `acceptEdits`, and tool selection. Missing
+required capabilities fail explicitly. The runner never
 falls back to `--dangerously-skip-permissions`. See the
 [Claude Code automation documentation](https://code.claude.com/docs/en/headless).
 

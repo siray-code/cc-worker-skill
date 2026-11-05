@@ -14,11 +14,13 @@ import re
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import uuid
 
 from workspace import (
@@ -44,6 +46,125 @@ def write_json(path, value):
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(value, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
     temporary.replace(path)
+
+
+CREDENTIAL_KEYS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL")
+PROXY_VARIABLES = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy")
+CLOUD_PROVIDER_VARIABLES = ("CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY")
+
+
+def settings_env():
+    """Read names and values of user-level Claude settings env entries; never print values."""
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    path = (Path(config_dir).expanduser() if config_dir else Path.home() / ".claude") / "settings.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    values = data.get("env") if isinstance(data, dict) else None
+    if not isinstance(values, dict):
+        return []
+    return [(str(path), {key: value for key, value in values.items() if isinstance(value, str)})]
+
+
+def configured_value(key):
+    value = os.environ.get(key, "").strip()
+    if value:
+        return value
+    for _, values in settings_env():
+        value = values.get(key, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def base_url():
+    value = os.environ.get("ANTHROPIC_BASE_URL", "").strip()
+    if value:
+        return value, "environment"
+    for source, values in settings_env():
+        value = values.get("ANTHROPIC_BASE_URL", "").strip()
+        if value:
+            return value, source
+    return "https://api.anthropic.com", "default"
+
+
+def credential_variables():
+    present = {key for key in CREDENTIAL_KEYS if os.environ.get(key)}
+    for _, values in settings_env():
+        present.update(key for key in CREDENTIAL_KEYS if values.get(key))
+    return sorted(present)
+
+
+def proxy_variables():
+    present = [key for key in PROXY_VARIABLES if os.environ.get(key)]
+    for _, values in settings_env():
+        present += [key for key in PROXY_VARIABLES if values.get(key) and key not in present]
+    return present
+
+
+def parse_endpoint(value):
+    try:
+        parsed = urllib.parse.urlsplit(value if "://" in value else "//" + value)
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        return None, None, None, "Invalid ANTHROPIC_BASE_URL: " + str(exc)
+    if not host:
+        return None, None, None, "Invalid ANTHROPIC_BASE_URL: the host is missing."
+    scheme = parsed.scheme or "https"
+    return host, port or (443 if scheme == "https" else 80), scheme, None
+
+
+def api_reachability():
+    """Probe the configured model API host without calling a model."""
+    value, source = base_url()
+    host, port, _, error = parse_endpoint(value)
+    result = {"endpoint_source": source, "host": host, "port": port}
+    if error:
+        result.update({"status": "invalid", "detail": error})
+        return result
+    if os.environ.get("CC_WORKER_SKIP_API_CHECK", "").strip():
+        result.update({"status": "skipped", "detail": "CC_WORKER_SKIP_API_CHECK is set"})
+        return result
+    providers = [key for key in CLOUD_PROVIDER_VARIABLES
+                 if configured_value(key).lower() not in ("", "0", "false", "no", "off")]
+    if providers:
+        result.update({"status": "skipped", "detail": "cloud provider configured: " + ", ".join(providers)})
+        return result
+    proxies = proxy_variables()
+    if proxies:
+        result.update({"status": "skipped", "detail": "proxy configured: " + ", ".join(proxies)})
+        return result
+    try:
+        addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        result.update({"status": "unreachable", "detail": "DNS lookup failed: " + str(exc)})
+        return result
+    failure = "no address was returned"
+    for family, socktype, proto, _, address in addresses:
+        try:
+            with socket.socket(family, socktype, proto) as connection:
+                connection.settimeout(4)
+                connection.connect(address)
+            result.update({"status": "ok", "detail": "TCP connection succeeded"})
+            return result
+        except OSError as exc:
+            failure = str(exc)
+    result.update({"status": "unreachable", "detail": "TCP connection failed: " + failure})
+    return result
+
+
+def unreachable_message(check):
+    detail = check.get("detail") or "preflight failed"
+    if check.get("status") == "invalid":
+        return "Cannot use the configured model API endpoint (" + detail + "). Fix ANTHROPIC_BASE_URL or the Claude settings before dispatching."
+    endpoint = str(check.get("host") or "the configured endpoint") + ":" + str(check.get("port"))
+    return ("Cannot reach the Claude model API at " + endpoint + " (" + detail + "). The worker "
+            "needs outbound network access. If Codex started it in a workspace-write sandbox, "
+            "network access is disabled by default: rerun the dispatch with "
+            "sandbox_permissions=\"require_escalated\" (or enable network access for the sandbox). "
+            "No worker changes were made and no attempt was consumed.")
 
 
 def state_root():
@@ -94,7 +215,8 @@ def save(directory, state):
 
 def public_result(directory, state):
     keys = ("run_id", "task_id", "status", "isolated", "session_id", "attempts", "summary",
-            "changed_files", "out_of_scope", "checks", "error", "fallback_reason", "cleaned", "metrics")
+            "changed_files", "out_of_scope", "checks", "error", "fallback_reason", "cleaned",
+            "metrics", "api_check")
     result = {key: state[key] for key in keys if key in state}
     for key in ("changed_files", "out_of_scope"):
         if len(result.get(key, [])) > 50:
@@ -279,9 +401,18 @@ def execute(directory, state, cli, correction=None):
             if state.get("cleaned") or state["status"] == "applied" or state["attempts"] >= 2:
                 raise WorkerError("This run cannot resume: it is applied, cleaned, or has reached two attempts.")
             if not state.get("session_id") or "--resume" not in help_text:
-                raise WorkerError("No resumable Claude session is available; Codex must take over.")
+                if state["attempts"] == 0:
+                    raise WorkerError("This run never started a worker; fix the reported issue and dispatch a new run.")
+                raise WorkerError("No resumable Claude session is available; review the result before deciding on takeover.")
             if scan(Path(state["workdir"]), state["is_git"]) != state.get("after"):
                 raise WorkerError("Workspace changed after the last attempt; review before redispatching.")
+        check = api_reachability()
+        state["api_check"] = check
+        if check["status"] in {"unreachable", "invalid"}:
+            state["status"] = "worker_failed"
+            state["error"] = redact(unreachable_message(check))
+            save(directory, state)
+            return public_result(directory, state)
         state["attempts"] += 1
         state["status"] = "running"
         state.pop("error", None)
@@ -337,6 +468,24 @@ def execute(directory, state, cli, correction=None):
                         state["status"] = "validating"
                         state["summary"] = redact(payload.get("result", ""))[:1200]
                         state["metrics"] = {key: payload[key] for key in ("num_turns", "duration_ms", "total_cost_usd", "usage") if key in payload}
+                    else:
+                        detail = payload.get("result")
+                        detail = detail.strip() if isinstance(detail, str) else ""
+                        notes = []
+                        if payload.get("api_error"):
+                            notes.append(str(payload["api_error"]))
+                        if payload.get("subtype") not in (None, "success"):
+                            notes.append("subtype " + str(payload["subtype"]))
+                        if notes:
+                            detail = (detail + " " if detail else "") + "(" + ", ".join(notes) + ")"
+                        if not detail:
+                            detail = "Claude exited with code " + str(outcome["exit_code"]) + "."
+                        if payload.get("api_error") == "connection_failed" or any(
+                                marker in detail for marker in ("ENOTFOUND", "ECONNREFUSED", "EAI_AGAIN")):
+                            detail += (" The worker could not reach the model API. If it ran inside a sandbox, "
+                                       "enable network access (for example with sandbox_permissions=\"require_escalated\") "
+                                       "and dispatch again.")
+                        state["error"] = redact(detail)[:1200]
                 except (WorkerError, ValueError, TypeError, AttributeError):
                     state["error"] = "Claude did not return a usable JSON result; inspect the attempt logs."
             if state["status"] == "validating":
@@ -432,10 +581,14 @@ def main(arguments=None):
     root = state_root()
     if args.command == "doctor":
         executable, help_text = capabilities()
-        return {"status": "ok", "python": sys.version.split()[0], "claude": executable,
-                "git": shutil.which("git"), "state_dir": str(root),
-                "resume_supported": "--resume" in help_text, "max_turns_supported": "--max-turns" in help_text,
-                "credential_variables_present": [key for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL") if os.environ.get(key)]}
+        api = api_reachability()
+        result = {"status": "ok", "python": sys.version.split()[0], "claude": executable,
+                  "git": shutil.which("git"), "state_dir": str(root),
+                  "resume_supported": "--resume" in help_text, "max_turns_supported": "--max-turns" in help_text,
+                  "credential_variables_present": credential_variables(), "api": api}
+        if api["status"] in {"unreachable", "invalid"}:
+            result["warnings"] = ["The model API is not reachable from this process. Enable network access before dispatching; under a Codex workspace-write sandbox use sandbox_permissions=\"require_escalated\"."]
+        return result
     if args.command in {"inspect", "apply", "cleanup", "resume"}:
         directory, state = load_run(root, args.run)
         if args.command == "inspect":
