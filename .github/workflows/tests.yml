@@ -1,0 +1,20 @@
+name: Tests
+
+on: [push, pull_request]
+
+jobs:
+  worker:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ['3.9', '3.13']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Check shell syntax
+        run: bash -n install.sh cc-worker/scripts/run-cc.sh
+      - name: Run offline integration tests
+        run: python3 -m unittest discover -s tests -v
