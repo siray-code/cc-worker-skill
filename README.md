@@ -69,6 +69,9 @@ For project-local installation, or a legacy directory explicitly used by your se
 # Alternatively: ./install.sh --target "$HOME/.codex/skills"
 ```
 
+Existing directory copies can be refreshed with `./install.sh --update` (only
+cc-worker-managed files are overwritten; unrelated files are kept). `./install.sh
+--daemon` installs/updates the skill and then runs `scripts/install-daemon.sh`.
 Install in one discovery location to avoid duplicate entries. Copying the complete
 `cc-worker/` directory there is also supported. Use `/skills` or `$cc-worker` in Codex;
 restart Codex if the skill does not appear.
@@ -91,12 +94,48 @@ directly. Independent tasks can run concurrently. Shared interfaces, lockfiles,
 dependent changes, and tests using shared mutable services must run in sequence.
 
 Codex's default `workspace-write` sandbox has no network access. The worker needs
-outbound access to the model API, so run the dispatch with
-`sandbox_permissions: "require_escalated"` (or set
-`[sandbox_workspace_write] network_access = true` in `~/.codex/config.toml`).
-`doctor` reports `api.status`; a blocked dispatch fails fast with no attempt consumed
-and no repository changes. Fix connectivity and dispatch again instead of taking over
-the implementation.
+outbound access to the model API. `network_access = true` under
+`[sandbox_workspace_write]` may be overridden by a managed profile, so `doctor`
+reports `api.status`, `daemon`, and `dispatch`:
+
+- `dispatch.mode = "daemon"`: submit the task; the worker runs outside the sandbox
+  (recommended).
+- `dispatch.mode = "direct"`: this process can reach the API; use `run`/`resume`.
+- `dispatch.status = "blocked"`: follow the `remedy` to install/start the daemon, or
+  ask the user to choose between a one-off manual run and Codex takeover. Do not loop
+  on "please run manually".
+
+### Out-of-sandbox daemon (recommended, macOS)
+
+Install once in a normal terminal (not inside Codex):
+
+```bash
+"$HOME/.agents/skills/cc-worker/scripts/install-daemon.sh"
+# If macOS TCC blocks launchd from reading the project:
+"$HOME/.agents/skills/cc-worker/scripts/install-daemon.sh" --terminal
+```
+
+The installer writes a shared `CC_WORKER_STATE_DIR` block into `~/.cc-worker.env`,
+loads the `com.siray.cc-worker` launchd agent, and prints a self-test. Then, from
+Codex:
+
+```bash
+RUNNER="$HOME/.agents/skills/cc-worker/scripts/run-cc.sh"
+"$RUNNER" submit --task /tmp/task.json --workdir /path/to/repo --isolated
+"$RUNNER" status --request <request-id>   # progress while running
+"$RUNNER" await --request <request-id>    # final public_result
+```
+
+Use `submit --resume --run <id> --prompt-file <file>`, `submit --apply --run <id>`,
+and `submit --cleanup --run <id>` for the review steps. `batch` in daemon mode means
+multiple independent `submit` requests. The state/queue directory must be writable by
+both Codex and the daemon; the default is the per-user temp directory. Rerun the
+installer after changing the toolchain PATH or the state directory.
+
+For non-Anthropic endpoints the runner sets `ENABLE_TOOL_SEARCH=false` and
+`CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` in the worker only. `doctor.provider`
+reports the detected host and compat keys; only set `CC_WORKER_PROVIDER_COMPAT=off`
+for an endpoint known to support tool search.
 
 ## Configure a provider
 
@@ -177,6 +216,17 @@ Capture each returned `run_id`. Review the patch and checks, then apply accepted
 "$RUNNER" cleanup --run <run-id>
 ```
 
+Inside Codex's sandbox or in daemon mode, use the queue interface:
+
+```bash
+"$RUNNER" submit --task /tmp/task.json --workdir /path/to/project --isolated
+"$RUNNER" status --request <request-id>
+"$RUNNER" await --request <request-id>
+"$RUNNER" submit --resume --run <run-id> --prompt-file /tmp/correction.txt
+"$RUNNER" submit --apply --run <run-id>
+"$RUNNER" submit --cleanup --run <run-id>
+```
+
 For one focused repair, put the correction in a text file and resume the exact session:
 
 ```bash
@@ -240,7 +290,7 @@ input or rejected operations, `130` for interruption. Full contracts and statuse
 ## Development
 
 ```bash
-bash -n install.sh cc-worker/scripts/run-cc.sh
+bash -n install.sh cc-worker/scripts/run-cc.sh cc-worker/scripts/install-daemon.sh
 python3 -m unittest discover -s tests -v
 ```
 

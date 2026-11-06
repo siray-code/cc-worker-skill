@@ -27,7 +27,10 @@ session = sys.argv[sys.argv.index("--resume") + 1] if "--resume" in sys.argv els
 
 def record(event):
     if action.get("record"):
-        entry = {"event": event, "task": request["task_id"], "session": session, "argv": sys.argv[1:], "time": time.monotonic()}
+        entry = {"event": event, "task": request["task_id"], "session": session,
+                 "argv": sys.argv[1:], "time": time.monotonic(),
+                 "env": {key: os.environ.get(key) for key in
+                         ("ENABLE_TOOL_SEARCH", "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS")}}
         fd = os.open(action["record"], os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         try:
             os.write(fd, (json.dumps(entry) + "\n").encode())
@@ -36,6 +39,14 @@ def record(event):
 
 
 record("start")
+stream = False
+if "--output-format" in sys.argv:
+    stream = sys.argv[sys.argv.index("--output-format") + 1] == "stream-json"
+if stream:
+    first_write = next(iter(action.get("writes", {})), "a.txt")
+    print(json.dumps({"type": "system", "subtype": "init", "session_id": session}), flush=True)
+    print(json.dumps({"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "name": "Edit", "input": {"file_path": first_write}}]}}), flush=True)
 for name, expected in action.get("assert_files", {}).items():
     if expected is None:
         assert not Path(name).exists(), name
@@ -67,8 +78,10 @@ else:
                       "num_turns": 2, "usage": {"input_tokens": 100, "output_tokens": 20}}
     for key in action.get("omit_fields", []):
         payload.pop(key, None)
-    for key in ("api_error", "terminal_reason"):
+    for key in ("api_error", "api_error_status", "terminal_reason"):
         if action.get(key):
             payload[key] = action[key]
+    if action.get("permission_denials"):
+        payload["permission_denials"] = action["permission_denials"]
     print(json.dumps(payload))
 sys.exit(1 if action.get("fail") else 0)

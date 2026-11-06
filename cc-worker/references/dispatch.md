@@ -43,6 +43,12 @@ plus TCP, no model call) without printing values.
 "$RUNNER" resume --run <run-id> --prompt-file /tmp/correction.txt
 "$RUNNER" apply --run <run-id>
 "$RUNNER" cleanup --run <run-id>
+"$RUNNER" submit --task /tmp/task.json --workdir /path/to/repo --isolated
+"$RUNNER" submit --resume --run <run-id> --prompt-file /tmp/correction.txt
+"$RUNNER" submit --apply --run <run-id>
+"$RUNNER" submit --cleanup --run <run-id>
+"$RUNNER" status --request <request-id>
+"$RUNNER" await --request <request-id>
 ```
 
 `RUNNER` denotes the resolved script in this skill. `run` is in place unless
@@ -76,12 +82,76 @@ Codex's `workspace-write` sandbox has `network_access: false` by default. Task f
 can be written inside the sandbox, but `run`/`resume` must execute with
 `sandbox_permissions: "require_escalated"` and a short justification, or after the
 user enables network access for Codex
-(`[sandbox_workspace_write] network_access = true`). Do not take over implementation
-because of a connection failure. `doctor` reports `api.status` as `ok`, `unreachable`, `invalid`,
-or `skipped`. `skipped` is not success: it means `CC_WORKER_SKIP_API_CHECK` is set, or
-a proxy variable or cloud provider flag (`CLAUDE_CODE_USE_BEDROCK`,
-`CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`) is configured, so the direct
-probe was bypassed.
+(`[sandbox_workspace_write] network_access = true`). In a managed profile that setting
+may not apply to the running session; check `doctor`, do not assume it. `doctor`
+reports `api.status` as `ok`, `unreachable`, `invalid`, or `skipped`. `skipped` is not
+success: it means `CC_WORKER_SKIP_API_CHECK` is set, or a proxy variable or cloud
+provider flag (`CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`,
+`CLAUDE_CODE_USE_FOUNDRY`) is configured, so the direct probe was bypassed.
+
+The sandbox may also expose the repository's `.git` as read-only. Snapshots then use
+a private object directory and run in place; `--isolated` falls back with a
+`fallback_reason`. If `prepare` fails with `Git command failed`, inspect the error's
+Git stderr and check `.git`/`.git/objects` write access. Git LFS and custom
+clean/smudge filters can still write under `.git` (for example `.git/lfs`) or need
+network; object redirection does not isolate filter drivers, so such repositories
+need the daemon or a normal writable checkout.
+
+## Daemon (out-of-sandbox execution)
+
+`doctor` reports `daemon.running`, `daemon.installed`, and a `dispatch` object. When
+`dispatch.mode` is `daemon`, submit tasks instead of running them from inside the
+sandbox:
+
+```bash
+"$RUNNER" submit --task /tmp/task.json --workdir /path/to/repo --isolated
+"$RUNNER" status --request <request-id>
+"$RUNNER" await --request <request-id>
+```
+
+`submit` validates the task, checks the daemon heartbeat/API/Claude binary, and writes
+the task content into `queue/requests/<id>.json` atomically. It returns
+`{"status":"ok","request_status":"queued","request_id":...,"state_dir":...}`.
+`status` returns `{"status":"ok","request":{...}}`, including `progress` while running
+and `result` when finished. `await` polls until completion and returns the final
+`public_result`. Use `status` every 30-60 seconds for long tasks; do not block `await`
+for an hour.
+
+Request types are `run`, `resume`, `apply`, and `cleanup`:
+
+- `submit --resume --run <id> --prompt-file <file>` resumes the exact session.
+- `submit --apply --run <id>` applies a reviewed isolated patch outside the sandbox.
+- `submit --cleanup --run <id>` removes the run-owned worktree.
+- `batch` in daemon mode is multiple independent `submit` requests; the daemon's
+  `--jobs` and the source lock serialize the same repository.
+
+Install the daemon once in a normal terminal (not inside Codex):
+
+```bash
+"$HOME/.agents/skills/cc-worker/scripts/install-daemon.sh"
+# or, when launchd cannot read the project (macOS TCC):
+"$HOME/.agents/skills/cc-worker/scripts/install-daemon.sh" --terminal
+```
+
+The installer writes a marked `CC_WORKER_STATE_DIR` block into `~/.cc-worker.env`,
+loads a launchd agent (`com.siray.cc-worker`), and prints a self-test. The state/queue
+directory must be writable by both Codex and the daemon; the default is the per-user
+temp directory. If the daemon cannot read the project, grant Full Disk Access to the
+daemon's Python or use `--terminal`, which inherits the terminal's TCC/PATH. Rerun
+`install-daemon.sh` after changing `PATH` (Go/Node toolchains) or the state directory.
+Use `install.sh --update` to refresh an existing directory copy of the skill and
+`install.sh --daemon` to install/update and start the daemon.
+
+For non-Anthropic endpoints the runner sets `ENABLE_TOOL_SEARCH=false` and
+`CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` in the worker only. Set
+`CC_WORKER_PROVIDER_COMPAT=off` only when the endpoint is known to support Claude
+Code's tool-search payload. `doctor.provider` reports the detected host and compat
+keys; `result.compat_env` lists the keys actually injected.
+
+The daemon is a deliberate sandbox bypass: the worker and its declared checks run
+with the user's normal privileges, and the shared queue is writable by same-user
+processes inside the Codex sandbox. Treat the state directory as trusted user data;
+do not put it on a shared multi-user path.
 
 ## Snapshot and review behavior
 
@@ -125,14 +195,18 @@ has no file allowlist or runner checks, and is intended only for compatibility.
 
 Result fields include `run_id`, `task_id`, `status`, `isolated`, `session_id`,
 `attempts`, `summary`, `changed_files`, `out_of_scope`, `checks`, `api_check`,
-`artifacts`, `workdir`, `result_file`, and `patch` when available. CLI-provided usage/cost metrics
-are recorded when present; they do not measure Codex savings or guarantee proxy billing.
-Full state and logs live in `result_file` and `attempt-N/`.
+`provider`, `compat_env`, `permission_denials`, `progress`, `private_objects`,
+`git_metadata_writable`, `artifacts`, `workdir`, `result_file`, and `patch` when
+available. CLI-provided usage/cost metrics are recorded when present; they do not
+measure Codex savings or guarantee proxy billing. Full state and logs live in
+`result_file` and `attempt-N/`; `progress.json` is updated live, and
+`attempt-N/events.jsonl` exists when the CLI supports stream-json.
 Large change lists in stdout are limited to 50 entries with a corresponding
 `changed_files_count` or `out_of_scope_count`; the result file retains the full lists.
 
 Statuses: `preparation_failed`, `prepared`, `running`, `worker_failed`, `timed_out`,
 `cancelled`, `validation_failed`, `scope_violation`, `ready_for_review`, `applied`.
+Queue requests use `queued`, `running`, `done`, `failed`, `interrupted`, `rejected`.
 `worker_failed` also covers a model API preflight failure; in that case `api_check`
 explains why, `attempts` is unchanged, and no worker ran. Scope violations block
 application even if the worker or checks otherwise succeeded.

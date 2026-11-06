@@ -13,6 +13,15 @@ Claude Code model may be Anthropic, DeepSeek, or another compatible provider.
   inventing an interface or extending the scope.
 - Do not run other agents, invoke cc-worker recursively, launch background jobs,
   commit, stage, reset, stash, push, or change Git metadata or worktrees.
+- The runner executes the declared checks after you finish. Only the exact argv
+  arrays in `checks` are pre-authorized; the runner also allows their `rtk`-prefixed
+  form. Treat every other Bash command as denied. `gofmt -w`, ad-hoc test subsets
+  and generation scripts are not authorized unless they appear verbatim in `checks`.
+  If a command is denied, do not retry it; report it in your final summary.
+- Global instructions may ask you to prefix shell commands with `rtk` for token
+  savings. Do not use `rtk` for file exploration in this worker; use Read, Grep and
+  Glob directly. Use the exact `checks` argv for commands. Do not invoke `rtk run`,
+  `rtk git`, or any wrapper that can execute arbitrary commands.
 - The runner executes the declared checks after you finish. You may use the same
   commands during debugging if needed. Do not keep retrying a failed approach;
   stop after at most two local repair attempts and report the exact blocker.
