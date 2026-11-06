@@ -253,14 +253,21 @@ class WorkerTests(unittest.TestCase):
     def make_git_read_only(self):
         git_dir = self.source / ".git"
         for path in sorted(git_dir.rglob("*"), reverse=True):
-            path.chmod(path.stat().st_mode & ~0o222)
+            try:
+                path.chmod(path.stat().st_mode & ~0o222)
+            except FileNotFoundError:
+                # Git background maintenance can create/remove lock files.
+                pass
         git_dir.chmod(git_dir.stat().st_mode & ~0o222)
 
     def restore_git_permissions(self):
         git_dir = self.source / ".git"
         git_dir.chmod(git_dir.stat().st_mode | 0o200)
         for path in git_dir.rglob("*"):
-            path.chmod(path.stat().st_mode | 0o200)
+            try:
+                path.chmod(path.stat().st_mode | 0o200)
+            except FileNotFoundError:
+                pass
 
     def test_read_only_git_snapshot_runs_in_place_and_exports_patch(self):
         (self.source / "a.txt").write_text("user a\n")
