@@ -67,8 +67,11 @@ cd cc-worker-skill
 # 也可以：./install.sh --target "$HOME/.codex/skills"
 ```
 
-建议只安装到一个发现目录，避免重复条目；也支持将完整 `cc-worker/` 目录复制过去。
-在 Codex 中通过 `/skills` 查找或用 `$cc-worker` 调用；未出现时重启 Codex。
+已存在的目录副本可用 `./install.sh --update` 原地更新（只覆盖 cc-worker 管理的文件，
+保留其他文件）；`./install.sh --daemon` 会在安装/更新后调用
+`scripts/install-daemon.sh` 启动沙箱外 daemon。建议只安装到一个发现目录，避免重复条目；
+也支持将完整 `cc-worker/` 目录复制过去。在 Codex 中通过 `/skills` 查找或用
+`$cc-worker` 调用；未出现时重启 Codex。
 
 ## 在 Codex 中使用
 
@@ -86,10 +89,43 @@ $cc-worker 给用户服务增加 CSV 导出并补充回归测试。
 共享接口、锁文件、存在实现依赖的任务，以及依赖共享可变服务的测试，需要顺序执行。
 
 Codex 默认的 `workspace-write` 沙箱不开放网络，而 worker 需要访问模型 API。
-因此派单时应使用 `sandbox_permissions: "require_escalated"`，或在
-`~/.codex/config.toml` 中设置 `[sandbox_workspace_write] network_access = true`。
-`doctor` 会报告 `api.status`；网络被拦截时派单会快速失败，不消耗尝试次数，也不会改动仓库。
-遇到连接失败应修复网络后重新派单，不要因此改为 Codex 自己实现。
+`~/.codex/config.toml` 里的 `[sandbox_workspace_write] network_access = true` 在托管
+profile 中可能不生效。`doctor` 会报告 `api.status`、`daemon` 和 `dispatch`：
+
+- `dispatch.mode = "daemon"`：用 `submit` 派单，worker 在沙箱外自动执行（推荐）。
+- `dispatch.mode = "direct"`：当前进程能访问模型 API，直接用 `run`/`resume`。
+- `dispatch.status = "blocked"`：按 `remedy` 安装/启动 daemon，或让用户选择手动执行
+  一次或由 Codex 直接实现；不要无限重复“请手动执行”。
+
+### 沙箱外后台执行（推荐，macOS）
+
+在普通终端（不要在 Codex 沙箱内）执行一次：
+
+```bash
+"$HOME/.agents/skills/cc-worker/scripts/install-daemon.sh"
+# 如果 macOS TCC 阻止 launchd 读取项目目录：
+"$HOME/.agents/skills/cc-worker/scripts/install-daemon.sh" --terminal
+```
+
+安装器会把共享状态目录写入 `~/.cc-worker.env`，加载 `com.siray.cc-worker`
+launchd agent，并打印自检结果。之后在 Codex 中：
+
+```bash
+RUNNER="$HOME/.agents/skills/cc-worker/scripts/run-cc.sh"
+"$RUNNER" submit --task /tmp/task.json --workdir /path/to/repo --isolated
+"$RUNNER" status --request <request-id>   # 运行中可看 progress
+"$RUNNER" await --request <request-id>    # 完成后的 public_result
+```
+
+需要修正、集成或清理时分别使用 `submit --resume --run <id> --prompt-file <file>`、
+`submit --apply --run <id>`、`submit --cleanup --run <id>`。`batch` 在 daemon 模式下
+拆成多个独立 `submit`。状态目录必须同时被 Codex 和 daemon 可写；默认使用当前用户的
+临时目录。更换 Go/Node 工具链或状态目录后，重新运行 `install-daemon.sh`。
+
+非 Anthropic endpoint 会自动在 worker 子进程中设置
+`ENABLE_TOOL_SEARCH=false` 和 `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1`；
+`doctor.provider` 会显示检测结果。不要在没有确认兼容性时设置
+`CC_WORKER_PROVIDER_COMPAT=off`。
 
 ## 配置模型服务
 
@@ -164,6 +200,17 @@ worker 结束后由执行器运行检查；`checks` 为空表示未执行 runner
 "$RUNNER" cleanup --run <run-id>
 ```
 
+沙箱内或 daemon 模式使用提交接口：
+
+```bash
+"$RUNNER" submit --task /tmp/task.json --workdir /path/to/project --isolated
+"$RUNNER" status --request <request-id>
+"$RUNNER" await --request <request-id>
+"$RUNNER" submit --resume --run <run-id> --prompt-file /tmp/correction.txt
+"$RUNNER" submit --apply --run <run-id>
+"$RUNNER" submit --cleanup --run <run-id>
+```
+
 需要修正时，将针对性指令写入文本文件并续接准确会话：
 
 ```bash
@@ -215,7 +262,7 @@ worktree 隔离文件，但共享 Git 元数据，不能隔离 shell、外部服
 ## 开发验证
 
 ```bash
-bash -n install.sh cc-worker/scripts/run-cc.sh
+bash -n install.sh cc-worker/scripts/run-cc.sh cc-worker/scripts/install-daemon.sh
 python3 -m unittest discover -s tests -v
 ```
 

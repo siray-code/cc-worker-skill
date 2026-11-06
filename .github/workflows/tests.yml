@@ -15,6 +15,6 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Check shell syntax
-        run: bash -n install.sh cc-worker/scripts/run-cc.sh
+        run: bash -n install.sh cc-worker/scripts/run-cc.sh cc-worker/scripts/install-daemon.sh
       - name: Run offline integration tests
         run: python3 -m unittest discover -s tests -v

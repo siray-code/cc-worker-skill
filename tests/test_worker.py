@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import signal
 import subprocess
@@ -13,6 +14,8 @@ import unittest
 
 REPO = Path(__file__).resolve().parents[1]
 RUNNER = REPO / "cc-worker" / "scripts" / "run-cc.sh"
+sys.path.insert(0, str(REPO / "cc-worker" / "scripts"))
+import workspace  # noqa: E402
 
 
 class WorkerTests(unittest.TestCase):
@@ -30,7 +33,8 @@ class WorkerTests(unittest.TestCase):
                          "CC_WORKER_STATE_DIR": str(self.base / "state"), "CC_WORKER_ENV_FILE": "",
                          "CC_WORKER_SKIP_API_CHECK": "1", "PYTHONDONTWRITEBYTECODE": "1",
                          "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0"})
-        for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "FAKE_HELP",
+        for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
+                    "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "FAKE_HELP",
                     "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
             self.env.pop(key, None)
         self.git("init", "-q")
@@ -246,6 +250,73 @@ class WorkerTests(unittest.TestCase):
         self.assertNotEqual(head.returncode, 0)
         self.assertFalse((initial / ".git" / "index").exists())
 
+    def make_git_read_only(self):
+        git_dir = self.source / ".git"
+        for path in sorted(git_dir.rglob("*"), reverse=True):
+            try:
+                path.chmod(path.stat().st_mode & ~0o222)
+            except FileNotFoundError:
+                # Git background maintenance can create/remove lock files.
+                pass
+        git_dir.chmod(git_dir.stat().st_mode & ~0o222)
+
+    def restore_git_permissions(self):
+        git_dir = self.source / ".git"
+        git_dir.chmod(git_dir.stat().st_mode | 0o200)
+        for path in git_dir.rglob("*"):
+            try:
+                path.chmod(path.stat().st_mode | 0o200)
+            except FileNotFoundError:
+                pass
+
+    def test_read_only_git_snapshot_runs_in_place_and_exports_patch(self):
+        (self.source / "a.txt").write_text("user a\n")
+        index_before = self.index()
+        self.make_git_read_only()
+        try:
+            result = self.run_task(isolated=False)
+        finally:
+            self.restore_git_permissions()
+        self.assertEqual(result["status"], "ready_for_review")
+        self.assertFalse(result["isolated"])
+        self.assertTrue(result["private_objects"])
+        self.assertEqual((self.source / "a.txt").read_text(), "worker a\n")
+        self.assertEqual(self.index(), index_before)
+        patch = Path(result["patch"]).read_text()
+        self.assertIn("-user a", patch)
+        self.assertIn("+worker a", patch)
+
+    def test_read_only_git_isolation_falls_back(self):
+        self.make_git_read_only()
+        try:
+            result = self.run_task(isolated=True)
+        finally:
+            self.restore_git_permissions()
+        self.assertEqual(result["status"], "ready_for_review")
+        self.assertFalse(result["isolated"])
+        self.assertIn("read-only", result["fallback_reason"])
+        self.assertEqual((self.source / "a.txt").read_text(), "worker a\n")
+
+    def test_snapshot_handles_repository_path_with_colon(self):
+        repo = self.base / "repo:colon"
+        repo.mkdir()
+        for argv in (["git", "init", "-q"], ["git", "config", "user.email", "t@t"],
+                     ["git", "config", "user.name", "t"]):
+            subprocess.run(argv, cwd=repo, env=self.env, check=True)
+        (repo / "a.txt").write_text("original a\n")
+        subprocess.run(["git", "add", "-A"], cwd=repo, env=self.env, check=True)
+        subprocess.run(["git", "commit", "-qm", "init"], cwd=repo, env=self.env, check=True)
+        result = self.invoke("run", "--task", self.file("colon.json", self.task()),
+                             "--workdir", str(repo), "--isolated")
+        self.assertEqual(result["status"], "ready_for_review")
+        self.invoke("apply", "--run", result["run_id"])
+        self.assertEqual((repo / "a.txt").read_text(), "worker a\n")
+
+    def test_git_error_includes_stderr(self):
+        with self.assertRaises(workspace.WorkerError) as caught:
+            workspace.git(self.source, "rev-parse", "--verify", "does-not-exist")
+        self.assertIn("fatal:", str(caught.exception))
+
     def test_non_git_directory_falls_back(self):
         plain = self.base / "plain"
         plain.mkdir()
@@ -299,6 +370,102 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(result["api"]["status"], "skipped")
         self.assertIn("CLAUDE_CODE_USE_BEDROCK", result["api"]["detail"])
 
+    def test_stream_json_progress_and_permission_denials(self):
+        self.env["FAKE_HELP"] = ("--append-system-prompt --output-format --permission-mode "
+                                 "--allowedTools --tools --resume --max-turns --model "
+                                 "--permission-prompts --disable-slash-commands stream-json --verbose")
+        denial = {"tool_name": "Bash", "tool_input": {"command": "rtk wc -l a.txt"}}
+        result = self.run_task(self.task(action={"permission_denials": [denial],
+                                                 "writes": {"a.txt": "worker a\n"}}))
+        self.assertEqual(result["status"], "ready_for_review")
+        self.assertEqual(result["permission_denials"], [denial])
+        progress = result["progress"]
+        self.assertEqual(progress["phase"], "finished")
+        self.assertGreaterEqual(progress["events"], 2)
+        self.assertEqual(progress["last_event"]["tool"], "Edit")
+        self.assertEqual(progress["observed_files"], ["a.txt"])
+
+    def test_provider_compat_is_injected_for_non_anthropic_endpoints(self):
+        events = self.base / "events.jsonl"
+        self.env["ANTHROPIC_BASE_URL"] = "https://api.deepseek.com/anthropic"
+        self.env["ANTHROPIC_MODEL"] = "deepseek-flash[1m]"
+        self.env["ENABLE_TOOL_SEARCH"] = "true"
+        result = self.run_task(self.task(action={"record": str(events)}))
+        self.assertEqual(result["status"], "ready_for_review")
+        self.assertFalse(result["provider"]["anthropic"])
+        self.assertIn("ENABLE_TOOL_SEARCH", result["compat_env"])
+        starts = [json.loads(line) for line in events.read_text().splitlines()
+                  if json.loads(line)["event"] == "start"]
+        self.assertEqual(starts[0]["env"]["ENABLE_TOOL_SEARCH"], "false")
+        self.assertEqual(starts[0]["env"]["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"], "1")
+
+    def test_provider_compat_is_not_injected_for_anthropic(self):
+        events = self.base / "events.jsonl"
+        self.env["ANTHROPIC_BASE_URL"] = "https://api.anthropic.com"
+        self.env["ANTHROPIC_MODEL"] = "claude-sonnet-5-5"
+        self.env["ENABLE_TOOL_SEARCH"] = "true"
+        result = self.run_task(self.task(action={"record": str(events)}))
+        self.assertEqual(result["status"], "ready_for_review")
+        self.assertTrue(result["provider"]["anthropic"])
+        self.assertEqual(result["compat_env"], [])
+        starts = [json.loads(line) for line in events.read_text().splitlines()
+                  if json.loads(line)["event"] == "start"]
+        self.assertEqual(starts[0]["env"]["ENABLE_TOOL_SEARCH"], "true")
+        self.assertIsNone(starts[0]["env"]["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"])
+
+    def test_worker_disables_unrelated_mcp_servers(self):
+        self.env["FAKE_HELP"] = ("--append-system-prompt --output-format --permission-mode "
+                                 "--allowedTools --tools --resume --max-turns --model "
+                                 "--permission-prompts --disable-slash-commands "
+                                 "--strict-mcp-config --mcp-config")
+        events = self.base / "events.jsonl"
+        result = self.run_task(self.task(action={"record": str(events)}))
+        self.assertEqual(result["status"], "ready_for_review")
+        starts = [json.loads(line) for line in events.read_text().splitlines()
+                  if json.loads(line)["event"] == "start"]
+        argv = starts[0]["argv"]
+        self.assertIn("--strict-mcp-config", argv)
+        self.assertEqual(argv[argv.index("--mcp-config") + 1], '{"mcpServers":{}}')
+
+    def test_rtk_allowlist_and_permission_denials_are_surfaced(self):
+        events = self.base / "events.jsonl"
+        check = [sys.executable, "-c", "print('checked')"]
+        denial = {"tool_name": "Bash", "tool_input": {"command": "rtk wc -l a.txt"}}
+        result = self.run_task(self.task(action={"record": str(events),
+                                                 "permission_denials": [denial]},
+                                         checks=[check]))
+        self.assertEqual(result["status"], "ready_for_review")
+        self.assertEqual(result["permission_denials"][0]["tool_name"], "Bash")
+        self.assertTrue(result["warnings"])
+        starts = [json.loads(line) for line in events.read_text().splitlines()
+                  if json.loads(line)["event"] == "start"]
+        argv = starts[0]["argv"]
+        start = argv.index("--allowedTools") + 1
+        end = argv.index("--tools")
+        allowed = argv[start:end]
+        self.assertIn("Bash(" + shlex.join(check) + ")", allowed)
+        self.assertIn("Bash(" + shlex.join(["rtk", *check]) + ")", allowed)
+        self.assertIn("Bash(rtk wc *)", allowed)
+
+    def test_doctor_reports_provider_and_sandbox(self):
+        self.env["ANTHROPIC_BASE_URL"] = "https://api.deepseek.com/anthropic"
+        self.env["ANTHROPIC_MODEL"] = "deepseek-flash[1m]"
+        self.env["CODEX_SANDBOX_NETWORK_DISABLED"] = "1"
+        result = self.invoke("doctor")
+        self.assertEqual(result["provider"]["host"], "api.deepseek.com")
+        self.assertFalse(result["provider"]["anthropic"])
+        self.assertTrue(result["provider"]["compat"])
+        self.assertTrue(result["sandbox"]["codex"])
+        self.assertTrue(result["sandbox"]["network_disabled_env"])
+
+    def test_tool_search_422_error_has_compat_hint(self):
+        action = {"is_error": True, "api_error_status": 422,
+                  "summary": "API Error: 422 Failed to deserialize: unknown variant `tool_definition`"}
+        result = self.run_task(self.task(action=action), code=1)
+        self.assertEqual(result["status"], "worker_failed")
+        self.assertIn("tool_definition", result["error"])
+        self.assertIn("ENABLE_TOOL_SEARCH=false", result["error"])
+
     def test_unreachable_api_fails_fast_without_consuming_attempt(self):
         events = self.base / "events.jsonl"
         self.env.pop("CC_WORKER_SKIP_API_CHECK")
@@ -348,6 +515,169 @@ class WorkerTests(unittest.TestCase):
         refused = subprocess.run(argv, env=self.env, capture_output=True, text=True)
         self.assertNotEqual(refused.returncode, 0)
         self.assertEqual((target / "cc-worker" / "keep").read_text(), "user data")
+
+    def test_installer_update_refreshes_managed_copy(self):
+        target = self.base / "existing skills"
+        install = target / "cc-worker"
+        (install / "scripts").mkdir(parents=True)
+        (install / "SKILL.md").write_text("old skill\n")
+        (install / "scripts" / "cc_worker.py").write_text("old worker\n")
+        (install / "user-note.txt").write_text("keep me\n")
+        updated = subprocess.run([str(REPO / "install.sh"), "--target", str(target), "--update"],
+                                 env=self.env, capture_output=True, text=True)
+        self.assertEqual(updated.returncode, 0, updated.stderr)
+        self.assertIn("# CC Worker", (install / "SKILL.md").read_text())
+        self.assertIn("def daemon_loop", (install / "scripts" / "cc_worker.py").read_text())
+        self.assertEqual((install / "user-note.txt").read_text(), "keep me\n")
+        foreign = self.base / "foreign"
+        (foreign / "cc-worker").mkdir(parents=True)
+        (foreign / "cc-worker" / "keep").write_text("not a skill")
+        refused = subprocess.run([str(REPO / "install.sh"), "--target", str(foreign), "--update"],
+                                 env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(refused.returncode, 0)
+
+    def test_install_daemon_dry_run_prints_launchd_configuration(self):
+        state = self.base / "daemon-state"
+        result = subprocess.run(
+            [str(REPO / "cc-worker" / "scripts" / "install-daemon.sh"), "--dry-run",
+             "--state-dir", str(state), "--probe-dir", str(self.source)],
+            env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("<key>Label</key>", result.stdout)
+        self.assertIn("com.siray.cc-worker", result.stdout)
+        self.assertIn(str(state), result.stdout)
+        self.assertIn("CC_WORKER_STATE_DIR", result.stdout)
+        self.assertFalse(state.exists())
+
+    def start_daemon(self):
+        state_dir = Path(self.env["CC_WORKER_STATE_DIR"])
+        process = subprocess.Popen(
+            [str(RUNNER), "daemon", "--state-dir", str(state_dir), "--poll", "0.05",
+             "--jobs", "1", "--probe-dir", str(self.source)],
+            cwd=self.source, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(self.stop_process, process)
+        heartbeat = state_dir / "queue" / "daemon.json"
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise AssertionError("daemon exited: " + process.stderr.read())
+            if heartbeat.is_file():
+                try:
+                    if json.loads(heartbeat.read_text()).get("pid"):
+                        return process
+                except ValueError:
+                    pass
+            time.sleep(0.05)
+        raise AssertionError("daemon did not write a heartbeat")
+
+    def stop_process(self, process):
+        if process.poll() is None:
+            process.send_signal(signal.SIGTERM)
+            try:
+                process.communicate(timeout=8)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+
+    def submit(self, *argv, **kwargs):
+        return self.invoke("submit", *argv, **kwargs)
+
+    def test_daemon_submit_status_await_round_trip(self):
+        self.start_daemon()
+        submitted = self.submit("--task", self.file("task.json", self.task()),
+                                "--workdir", str(self.source))
+        self.assertEqual(submitted["request_status"], "queued")
+        request_id = submitted["request_id"]
+        doctor = self.invoke("doctor")
+        self.assertTrue(doctor["daemon"]["running"])
+        self.assertEqual(doctor["dispatch"]["mode"], "daemon")
+        status = self.invoke("status", "--request", request_id)
+        self.assertIn(status["request"]["state"], {"queued", "running", "done"})
+        final = self.invoke("await", "--request", request_id, "--timeout", "20")
+        self.assertEqual(final["status"], "ready_for_review")
+        self.assertEqual((self.source / "a.txt").read_text(), "worker a\n")
+        done = self.invoke("status", "--request", request_id)
+        self.assertEqual(done["request"]["state"], "done")
+        self.assertEqual(done["request"]["result"]["status"], "ready_for_review")
+
+    def test_daemon_status_reports_live_progress(self):
+        self.start_daemon()
+        task = self.task(action={"sleep": 0.6, "writes": {"a.txt": "worker a\n"}})
+        submitted = self.submit("--task", self.file("task.json", task),
+                                "--workdir", str(self.source))
+        request_id = submitted["request_id"]
+        progress = None
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            status = self.invoke("status", "--request", request_id)["request"]
+            if status.get("progress"):
+                progress = status["progress"]
+                break
+            if status.get("state") in {"done", "failed"}:
+                break
+            time.sleep(0.05)
+        self.assertIsNotNone(progress, "status did not expose progress while running")
+        self.assertIn(progress["phase"], {"worker", "checks", "finished"})
+        self.invoke("await", "--request", request_id, "--timeout", "20")
+
+    def test_daemon_singleton_lock(self):
+        self.start_daemon()
+        state_dir = self.env["CC_WORKER_STATE_DIR"]
+        second = subprocess.run(
+            [str(RUNNER), "daemon", "--state-dir", str(state_dir), "--poll", "0.05",
+             "--probe-dir", str(self.source)],
+            cwd=self.source, env=self.env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(second.returncode, 2, second.stdout + second.stderr)
+        self.assertIn("Another cc-worker daemon", second.stderr)
+
+    def test_daemon_resolves_subdirectory_workdir(self):
+        self.start_daemon()
+        subdir = self.source / "src"
+        subdir.mkdir()
+        submitted = self.submit("--task", self.file("task.json", self.task()),
+                                "--workdir", str(subdir))
+        final = self.invoke("await", "--request", submitted["request_id"], "--timeout", "20")
+        self.assertEqual(final["status"], "ready_for_review")
+        self.assertEqual((self.source / "a.txt").read_text(), "worker a\n")
+
+    def test_daemon_submit_requires_running_daemon(self):
+        result = self.submit("--task", self.file("task.json", self.task()),
+                             "--workdir", str(self.source), code=2)
+        self.assertIn("daemon is not running", result["error"])
+
+    def test_daemon_isolated_apply_and_cleanup(self):
+        self.start_daemon()
+        submitted = self.submit("--task", self.file("task.json", self.task()),
+                                "--workdir", str(self.source), "--isolated")
+        request_id = submitted["request_id"]
+        final = self.invoke("await", "--request", request_id, "--timeout", "20")
+        self.assertEqual(final["status"], "ready_for_review")
+        self.assertTrue(final["isolated"])
+        self.assertEqual((self.source / "a.txt").read_text(), "original a\n")
+        run_id = final["run_id"]
+        applied = self.submit("--apply", run_id)
+        self.assertEqual(self.invoke("await", "--request", applied["request_id"], "--timeout", "20")["status"],
+                         "applied")
+        self.assertEqual((self.source / "a.txt").read_text(), "worker a\n")
+        cleaned = self.submit("--cleanup", run_id)
+        self.assertTrue(self.invoke("await", "--request", cleaned["request_id"], "--timeout", "20")["cleaned"])
+        self.assertFalse(Path(final["workdir"]).exists())
+
+    def test_daemon_resume_uses_the_exact_session(self):
+        self.start_daemon()
+        check = [sys.executable, "-c", "from pathlib import Path; assert Path('a.txt').read_text() == 'fixed\\n'"]
+        task = self.task(action={"writes": {"a.txt": "broken\n"}}, checks=[check])
+        submitted = self.submit("--task", self.file("task.json", task),
+                                "--workdir", str(self.source))
+        first = self.invoke("await", "--request", submitted["request_id"], "--timeout", "20", code=1)
+        self.assertEqual(first["status"], "validation_failed")
+        correction = self.base / "repair.txt"
+        correction.write_text(json.dumps({"writes": {"a.txt": "fixed\n"}}))
+        resumed = self.submit("--resume", first["run_id"], "--prompt-file", str(correction))
+        fixed = self.invoke("await", "--request", resumed["request_id"], "--timeout", "20")
+        self.assertEqual(fixed["status"], "ready_for_review")
+        self.assertEqual(fixed["attempts"], 2)
+        self.assertEqual(fixed["session_id"], first["session_id"])
 
     def test_binary_patch_round_trip(self):
         (self.source / "asset.bin").write_bytes(bytes(range(256)))

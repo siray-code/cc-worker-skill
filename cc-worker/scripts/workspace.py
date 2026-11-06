@@ -3,8 +3,10 @@
 import hashlib
 import os
 from pathlib import Path, PurePosixPath
+import shutil
 import stat
 import subprocess
+import uuid
 
 
 class WorkerError(Exception):
@@ -13,21 +15,95 @@ class WorkerError(Exception):
 
 def git(root, *args, env=None, data=None, check=True):
     process_env = os.environ.copy()
-    # Do not inherit another command's alternate index or Git directory.
-    for key in ("GIT_INDEX_FILE", "GIT_DIR", "GIT_WORK_TREE"):
+    # Do not inherit another command's alternate index, Git directory or object store.
+    for key in ("GIT_INDEX_FILE", "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR",
+                "GIT_NAMESPACE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"):
         process_env.pop(key, None)
     if env:
         process_env.update(env)
     # check-ignore already takes literal paths and rejects Git's pathspec magic.
     literal = [] if args[0] == "check-ignore" else ["--literal-pathspecs"]
     result = subprocess.run(
-        ["git", *literal, "-c", "core.hooksPath=/dev/null", *args],
+        ["git", *literal,
+         "-c", "core.hooksPath=/dev/null", "-c", "core.splitIndex=false",
+         "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", *args],
         cwd=str(root), env=process_env, input=data, stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
     if check and result.returncode:
-        raise WorkerError("Git command failed: " + " ".join(args[:2]))
+        detail = os.fsdecode(result.stderr).strip().splitlines()
+        message = "Git command failed: " + " ".join(args[:2])
+        if detail:
+            message += " (" + detail[-1] + ")"
+        raise WorkerError(message)
     return result
+
+
+def git_path(root, *args):
+    """Resolve a path reported by `git rev-parse` against the repository root."""
+    value = os.fsdecode(git(root, "rev-parse", *args).stdout).strip()
+    path = Path(value)
+    return path if path.is_absolute() else (root / path).resolve()
+
+
+def git_metadata_writable(root):
+    """Return whether Git can write its object store and common metadata.
+
+    Codex's workspace-write sandbox exposes `.git` read-only.  A mode-bit check is
+    not enough because the sandbox enforces writes at the syscall layer, so probe
+    by creating and removing a private file in both locations.
+    """
+    try:
+        directories = (git_path(root, "--git-common-dir"), git_path(root, "--git-path", "objects"))
+    except (WorkerError, OSError):
+        return False
+    for directory in directories:
+        if not directory.is_dir():
+            return False
+        probe = directory / (".cc-worker-write-probe-" + uuid.uuid4().hex)
+        try:
+            with probe.open("xb") as handle:
+                handle.write(b"")
+        except OSError:
+            return False
+        finally:
+            try:
+                probe.unlink()
+            except OSError:
+                pass
+    return True
+
+
+def c_quote(value):
+    """C-style quote one path for GIT_ALTERNATE_OBJECT_DIRECTORIES."""
+    quoted = ['"']
+    for byte in os.fsencode(value):
+        if byte == 0x22:
+            quoted.append('\\"')
+        elif byte == 0x5C:
+            quoted.append("\\\\")
+        elif 0x20 <= byte < 0x7F:
+            quoted.append(chr(byte))
+        else:
+            quoted.append("\\%03o" % byte)
+    quoted.append('"')
+    return "".join(quoted)
+
+
+def object_env(root, destination, index, private_objects):
+    """Build the Git environment for a snapshot or patch export."""
+    env = {"GIT_INDEX_FILE": str(index)}
+    if not private_objects:
+        return env
+    objects = destination / "objects"
+    objects.mkdir(mode=0o700, exist_ok=True)
+    try:
+        source_objects = git_path(root, "--git-path", "objects")
+    except (WorkerError, OSError):
+        source_objects = Path(root) / ".git" / "objects"
+    env.update({"GIT_OBJECT_DIRECTORY": str(objects),
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES": c_quote(str(source_objects))})
+    return env
 
 
 def split_paths(data):
@@ -119,10 +195,10 @@ def changed_paths(before, after):
     return sorted(name for name in before.keys() | after.keys() if before.get(name) != after.get(name))
 
 
-def snapshot(root, destination, extra_files, all_untracked=False):
+def snapshot(root, destination, extra_files, all_untracked=False, private_objects=False):
     """Write a private tree/commit using an alternate index; never update refs."""
     index = destination / "snapshot.index"
-    env = {"GIT_INDEX_FILE": str(index)}
+    env = object_env(root, destination, index, private_objects)
     git(root, "read-tree", "HEAD" if head_exists(root) else "--empty", env=env)
     git(root, "add", "-u", env=env)
     names = tracked_paths(root) | set(extra_files)
@@ -147,11 +223,11 @@ def create_worktree(source, path, commit):
     git(source, "worktree", "add", "--detach", str(path), commit)
 
 
-def export_patch(root, run_dir, baseline, before, declared):
+def export_patch(root, run_dir, baseline, before, declared, private_objects=False):
     # Include new observable files so scope violations cannot disappear from review.
     new_files = untracked_paths(root) - set(before)
     index = run_dir / "export.index"
-    env = {"GIT_INDEX_FILE": str(index)}
+    env = object_env(root, run_dir, index, private_objects)
     git(root, "read-tree", baseline, env=env)
     git(root, "add", "-u", env=env)
     names = new_files | set(declared)
@@ -199,6 +275,9 @@ def remove_worktree(state, run_dir):
     if state.get("cleaned"):
         return
     if not state["isolated"]:
+        if state.get("private_objects"):
+            shutil.rmtree(run_dir / "objects", ignore_errors=True)
+            (run_dir / "snapshot.index").unlink(missing_ok=True)
         state["cleaned"] = True
         return
     expected = run_dir / "worktree"
